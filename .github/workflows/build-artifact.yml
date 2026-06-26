@@ -1,1 +1,74 @@
+name: Build Artifact
 
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm clang lld xxd unzip wget python3 pkg-config
+
+      - name: Install PS5 Payload SDK + pacbrew libs
+        run: |
+          curl -fsSL https://github.com/ps5-payload-dev/pacbrew-repo/releases/latest/download/ps5-payload-dev.tar.gz -o /tmp/sdk.tar.gz
+          sudo tar -xzf /tmp/sdk.tar.gz -C /
+          ls /opt/ps5-payload-sdk/bin | head
+
+      - name: Build
+        run: make PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sonicloader
+          path: sonic-loader.elf
+
+      # Replace the sonic-loader.elf asset on the most-recent release so
+      # the binary visible on the repo's Releases page tracks main. CI
+      # only fires on push to main (see `on:` above), so versioned tag
+      # releases are still cut by hand — we just keep their asset fresh.
+      - name: Publish ELF to latest release
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Find the most-recent release (Gitea returns newest-first).
+          release_json="$(curl -fsSL \
+              -H "Authorization: token ${GITEA_TOKEN}" \
+              "${GITEA_API}/releases?limit=1")"
+          release_id="$(printf '%s' "$release_json" \
+              | python3 -c 'import sys,json; r=json.load(sys.stdin); print(r[0]["id"])')"
+          release_tag="$(printf '%s' "$release_json" \
+              | python3 -c 'import sys,json; r=json.load(sys.stdin); print(r[0]["tag_name"])')"
+          echo "Targeting release ${release_tag} (id=${release_id})"
+          # Delete any pre-existing sonic-loader.elf asset on that release.
+          assets_json="$(curl -fsSL \
+              -H "Authorization: token ${GITEA_TOKEN}" \
+              "${GITEA_API}/releases/${release_id}/assets")"
+          old_id="$(printf '%s' "$assets_json" \
+              | python3 -c 'import sys,json; [print(a["id"]) for a in json.load(sys.stdin) if a["name"]=="sonic-loader.elf"]' \
+              | head -n1)"
+          if [ -n "${old_id}" ]; then
+            echo "Removing existing asset id=${old_id}"
+            curl -fsSL -X DELETE \
+              -H "Authorization: token ${GITEA_TOKEN}" \
+              "${GITEA_API}/releases/${release_id}/assets/${old_id}"
+          fi
+          # Upload the freshly-built binary.
+          curl -fsSL -X POST \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -F "attachment=@sonic-loader.elf;type=application/octet-stream" \
+            "${GITEA_API}/releases/${release_id}/assets?name=sonic-loader.elf" \
+            | python3 -c 'import sys,json; r=json.load(sys.stdin); print("uploaded:", r["browser_download_url"])'
